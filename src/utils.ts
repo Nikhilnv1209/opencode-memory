@@ -25,7 +25,27 @@ export function now(): number {
   return Date.now()
 }
 
-/** Format conversation messages for the extraction prompt. */
+/** Tools that only read information — skip entirely. */
+const READ_ONLY_TOOLS = new Set([
+  "grep", "read", "glob", "find", "list", "lsp", "skill", "task",
+  "todowrite", "question", "webfetch", "github-triage", "github-pr-search",
+])
+
+/** Bash command patterns that are informational only — skip. */
+const INFORMATIONAL_BASH = /^(ls|cat|head|tail|wc|sort|uniq|cut|tr|awk|sed|diff|file|stat|du|df|ps|whoami|pwd|echo|which|whereis|man|help|history|id|uname|hostname|date|uptime|env|printenv|find|grep|rg|fd|xargs|git\s+(log|show|diff|status|branch))\b/
+
+/** Format conversation messages for the extraction prompt.
+ *
+ * Passes user messages, assistant text responses, and action tool calls.
+ * Tool OUTPUTS are never included — they cause false memories (e.g. git log
+ * commit messages get extracted as "work the user did").
+ *
+ * Tool INPUTS are included only for action tools:
+ * - edit/write: includes the file path (what was changed)
+ * - bash: includes the command text, but skips informational commands
+ *   (ls, cat, grep, git log, etc. — the agent already summarized these)
+ * - Read-only tools (grep, read, glob, find, etc.): skipped entirely
+ */
 export function formatConversation(messages: Array<{ info: Message; parts: Part[] }>): string {
   const lines: string[] = []
 
@@ -46,15 +66,30 @@ export function formatConversation(messages: Array<{ info: Message; parts: Part[
       if (textParts) lines.push(`[assistant]\n${textParts}`)
     }
 
-    // Include tool calls (truncated)
+    // Include action tool calls — inputs only, never outputs
     for (const part of msg.parts) {
       if (part.type !== "tool") continue
-      const tool = part as { tool: string; state: { status: string; input?: unknown; output?: string; title?: string } }
-      if (tool.state.status !== "completed") continue
+      const toolPart = part as {
+        tool: string
+        state: { status: string; input?: Record<string, unknown> }
+      }
+      if (toolPart.state.status !== "completed") continue
 
-      const input = JSON.stringify(tool.state.input ?? {}).slice(0, 200)
-      const output = (tool.state.output ?? "").slice(0, 500)
-      lines.push(`[tool: ${tool.tool}]\ninput: ${input}\noutput: ${output}`)
+      const toolName = toolPart.tool
+      const input = toolPart.state.input ?? {}
+
+      // Skip read-only tools entirely
+      if (READ_ONLY_TOOLS.has(toolName)) continue
+
+      if (toolName === "edit" || toolName === "write") {
+        const filePath = (input as { filePath?: string }).filePath
+        if (filePath) lines.push(`[tool: ${toolName}] ${filePath}`)
+      } else if (toolName === "bash") {
+        const command = (input as { command?: string }).command ?? ""
+        if (command && !INFORMATIONAL_BASH.test(command.trim())) {
+          lines.push(`[tool: bash] ${command.slice(0, 200)}`)
+        }
+      }
     }
   }
 

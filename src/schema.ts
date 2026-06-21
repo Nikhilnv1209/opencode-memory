@@ -102,4 +102,11 @@ CREATE TABLE IF NOT EXISTS personality_state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- Track temp extraction session IDs so backfill can skip them.
+-- These persist across plugin restarts (the in-memory Set does not).
+CREATE TABLE IF NOT EXISTS extraction_sessions (
+  session_id TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL
+);
 `

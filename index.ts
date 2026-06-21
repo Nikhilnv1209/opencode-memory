@@ -82,6 +82,38 @@ export default (async (ctx, options) => {
 
   const semaphore = new Semaphore(opts.maxConcurrentExtractions)
 
+  /** Check if a session ID is a known extraction session (temp session created by this plugin). */
+  function isExtractionSession(sessionID: string): boolean {
+    if (extractionSessions.has(sessionID)) return true
+    const row = globalDb.query("SELECT 1 FROM extraction_sessions WHERE session_id = ?").get(sessionID)
+    return !!row
+  }
+
+  /** Cached map of all tool IDs set to false (disabled).
+   *  Fetched once from the server, reused for all extraction sessions. */
+  let cachedDisabledTools: Record<string, boolean> | null = null
+
+  async function getDisabledTools(): Promise<Record<string, boolean>> {
+    if (cachedDisabledTools) return cachedDisabledTools
+    try {
+      const result = await ctx.client.tool.ids()
+      const ids = result.data ?? []
+      cachedDisabledTools = {}
+      for (const id of ids) {
+        cachedDisabledTools[id] = false
+      }
+    } catch {
+      // If tool.ids() fails, fall back to disabling common tools by name
+      cachedDisabledTools = {
+        bash: false, edit: false, read: false, write: false,
+        grep: false, glob: false, task: false, webfetch: false,
+        todowrite: false, question: false, skill: false,
+        list: false, lsp: false, memory_backfill: false, memory_search: false,
+      }
+    }
+    return cachedDisabledTools
+  }
+
   /**
    * Extract memories from a single session.
    * Uses the semaphore to limit concurrency (default: 1 = sequential).
@@ -89,7 +121,7 @@ export default (async (ctx, options) => {
    */
   async function runExtraction(sessionID: string) {
     if (disposed) return
-    if (extractionSessions.has(sessionID)) return
+    if (isExtractionSession(sessionID)) return
     if (extractingSessions.has(sessionID)) return
 
     extractingSessions.add(sessionID)
@@ -102,8 +134,10 @@ export default (async (ctx, options) => {
       const messages = result.data ?? []
       if (messages.length === 0) return
 
+      const disabledTools = await getDisabledTools()
+
       const memories = await extractMemories(
-        messages, ctx, opts, sessionID, ctx.worktree, extractionSessions,
+        messages, ctx, opts, sessionID, ctx.worktree, extractionSessions, globalDb, disabledTools,
       )
 
       if (disposed) return
@@ -134,7 +168,7 @@ export default (async (ctx, options) => {
     const results = await Promise.all(
       sessionIDs.map(async (sessionID) => {
         if (disposed) return
-        if (extractionSessions.has(sessionID)) return
+        if (isExtractionSession(sessionID)) return
         if (extractingSessions.has(sessionID)) return
         if (countMemoriesBySession(db, sessionID) > 0) return
 
@@ -148,8 +182,10 @@ export default (async (ctx, options) => {
           const messages = result.data ?? []
           if (messages.length === 0) return
 
+          const disabledTools = await getDisabledTools()
+
           const memories = await extractMemories(
-            messages, ctx, opts, sessionID, ctx.worktree, extractionSessions,
+            messages, ctx, opts, sessionID, ctx.worktree, extractionSessions, globalDb, disabledTools,
           )
 
           if (disposed) return
@@ -184,7 +220,7 @@ export default (async (ctx, options) => {
   return {
     // 1. INJECT: personality + primer + index (within contextBudget)
     "experimental.chat.system.transform": async (req, output) => {
-      if (req.sessionID && extractionSessions.has(req.sessionID)) return
+      if (req.sessionID && isExtractionSession(req.sessionID)) return
       if (disposed) return
 
       try {
@@ -210,7 +246,7 @@ export default (async (ctx, options) => {
     // 2. EXTRACT at compaction (last chance before data loss)
     "experimental.session.compacting": async (req) => {
       if (!opts.triggers.includes("compaction")) return
-      if (extractionSessions.has(req.sessionID)) return
+      if (isExtractionSession(req.sessionID)) return
       await runExtraction(req.sessionID)
     },
 
@@ -221,7 +257,7 @@ export default (async (ctx, options) => {
 
       const sessionID = (event.properties as { sessionID?: string })?.sessionID
       if (!sessionID) return
-      if (extractionSessions.has(sessionID)) return
+      if (isExtractionSession(sessionID)) return
       await runExtraction(sessionID)
     },
 
@@ -241,9 +277,10 @@ export default (async (ctx, options) => {
 
           // List mode: show unprocessed sessions
           if (!args.sessionIDs && !args.all) {
-            const result = await ctx.client.session.list()
+            const result = await ctx.client.session.list({ query: { directory: ctx.directory } })
             const sessions = (result.data ?? [])
-              .filter((s) => s.title !== "memory-extraction")
+              .filter((s) => s.directory === ctx.directory)
+              .filter((s) => !isExtractionSession(s.id))
               .sort((a, b) => b.time.created - a.time.created)
 
             const unprocessed: Array<{ id: string; title: string; created: string }> = []
@@ -274,9 +311,10 @@ export default (async (ctx, options) => {
           }
 
           // Determine which sessions to process
-          const result = await ctx.client.session.list()
+          const result = await ctx.client.session.list({ query: { directory: ctx.directory } })
           const allSessions = (result.data ?? [])
-            .filter((s) => s.title !== "memory-extraction")
+            .filter((s) => s.directory === ctx.directory)
+            .filter((s) => !isExtractionSession(s.id))
             .sort((a, b) => b.time.created - a.time.created)
 
           let targets: string[]
