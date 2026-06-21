@@ -10,10 +10,12 @@ import { GLOBAL_SCHEMA } from "./src/schema.ts"
 import {
   initDb, storeMemory, getRecentMemoriesDecayed, getTopicIndex,
   pruneMemories, countMemoriesBySession, searchMemories, boostAccessed,
+  deleteMemory, updateMemory, getMemoryById,
 } from "./src/db.ts"
 import { extractMemories, type ExtractOpts, ensureAgentFile } from "./src/extract.ts"
 import { generatePrimer, generateIndex } from "./src/primer.ts"
-import { hashDir } from "./src/utils.ts"
+import { hashDir, newId } from "./src/utils.ts"
+import type { Memory } from "./src/schema.ts"
 
 /**
  * Simple semaphore for limiting concurrent extractions.
@@ -152,7 +154,7 @@ export default (async (ctx, options) => {
       if (messages.length === 0) return
 
       const memories = await extractMemories(
-        messages, ctx, opts, sessionID, ctx.worktree, extractionSessions, globalDb,
+        messages, ctx, opts, sessionID, ctx.worktree, extractionSessions, globalDb, db,
       )
 
       if (disposed) return
@@ -215,7 +217,7 @@ export default (async (ctx, options) => {
         }
 
         const memories = await extractMemories(
-          messages, ctx, opts, session.id, ctx.worktree, extractionSessions, globalDb,
+          messages, ctx, opts, session.id, ctx.worktree, extractionSessions, globalDb, db,
         )
 
         if (disposed) break
@@ -420,10 +422,9 @@ export default (async (ctx, options) => {
           }
 
           return {
-            output: memories
-              .map((m, i) =>
-                `${i + 1}. [${m.type}/${m.scope}] ${m.title}\n   ${m.content.slice(0, 200)}\n   Keywords: ${(m.keywords ?? []).join(", ")} | Importance: ${m.importance}`,
-              )
+            output: memories.map((m, i) =>
+              `${i + 1}. id: ${m.id}\n   [${m.type}/${m.scope}] ${m.title}\n   ${m.content.slice(0, 200)}\n   Keywords: ${(m.keywords ?? []).join(", ")} | Importance: ${m.importance}`,
+            )
               .join("\n\n"),
           }
         },
@@ -459,8 +460,106 @@ export default (async (ctx, options) => {
 
           return {
             output: results
-              .map((m) => `[${m.type}/${m.scope}] ${m.title}\n${m.content}\nKeywords: ${(m.keywords ?? []).join(", ")}`)
+              .map((m) => `id: ${m.id}\n[${m.type}/${m.scope}] ${m.title}\n${m.content}\nKeywords: ${(m.keywords ?? []).join(", ")}`)
               .join("\n\n---\n\n"),
+          }
+        },
+      }),
+
+      // Manually add a memory
+      memory_add: tool({
+        description:
+          "Manually add a memory. Use when the user explicitly asks to remember something, or when extraction missed something important. The memory is stored immediately — no LLM extraction needed.",
+        args: {
+          title: tool.schema.string().describe("Short title (max 80 chars), include file paths if relevant"),
+          content: tool.schema.string().describe("Full description with intent, evidence, and reasoning. Be rich and specific."),
+          type: tool.schema.string().describe("episodic | semantic | procedural | prospective"),
+          scope: tool.schema.string().optional().describe("project | personality (default: project)"),
+          category: tool.schema.string().optional().describe("Free-form category (e.g., bugfix, feature, decision, preference)"),
+          topic: tool.schema.string().optional().describe("kebab-case topic linking related memories"),
+          keywords: tool.schema.array(tool.schema.string()).optional().describe("Searchable tags"),
+          importance: tool.schema.number().optional().describe("0.0-1.0 (default: 0.7)"),
+        },
+        async execute(args) {
+          if (disposed) return { output: "Plugin is disposed." }
+
+          const validTypes = ["episodic", "semantic", "procedural", "prospective"]
+          if (!validTypes.includes(args.type)) {
+            return { output: `Invalid type. Must be one of: ${validTypes.join(", ")}` }
+          }
+
+          const mem: Memory = {
+            id: newId(),
+            session_id: "manual",
+            project_id: ctx.worktree,
+            scope: (args.scope as Memory["scope"]) ?? "project",
+            type: args.type as Memory["type"],
+            category: args.category ?? "general",
+            topic: args.topic ?? "general",
+            title: args.title.slice(0, 200),
+            content: args.content,
+            keywords: args.keywords ?? [],
+            importance: args.importance ?? 0.7,
+            created_at: Date.now(),
+            last_accessed: 0,
+            access_count: 0,
+            superseded_by: null,
+            source: "manual",
+            deleted: 0,
+          }
+
+          storeMemory(db, mem)
+          return { output: `Memory added: ${mem.title} (importance: ${mem.importance})` }
+        },
+      }),
+
+      // Update an existing memory
+      memory_update: tool({
+        description:
+          "Update an existing memory by ID. Use when the user wants to edit, enrich, or correct a stored memory.",
+        args: {
+          id: tool.schema.string().describe("Memory ID to update"),
+          title: tool.schema.string().optional().describe("New title"),
+          content: tool.schema.string().optional().describe("New content"),
+          importance: tool.schema.number().optional().describe("New importance (0.0-1.0)"),
+          keywords: tool.schema.array(tool.schema.string()).optional().describe("New keywords"),
+        },
+        async execute(args) {
+          if (disposed) return { output: "Plugin is disposed." }
+
+          const existing = getMemoryById(db, args.id)
+          if (!existing) return { output: `Memory not found: ${args.id}` }
+          if (existing.deleted) return { output: `Memory is deleted: ${args.id}` }
+
+          const updated = updateMemory(db, args.id, {
+            title: args.title,
+            content: args.content,
+            importance: args.importance,
+            keywords: args.keywords,
+          })
+
+          return { output: `Memory updated: ${updated?.title ?? existing.title}` }
+        },
+      }),
+
+      // Delete a memory (soft delete — prevents re-extraction)
+      memory_delete: tool({
+        description:
+          "Delete a memory by ID. The memory is soft-deleted — it won't appear in search or lists, and the extraction system won't re-extract it. Use when a memory is wrong or no longer relevant.",
+        args: {
+          id: tool.schema.string().describe("Memory ID to delete"),
+        },
+        async execute(args) {
+          if (disposed) return { output: "Plugin is disposed." }
+
+          const existing = getMemoryById(db, args.id)
+          if (!existing) return { output: `Memory not found: ${args.id}` }
+
+          const deleted = deleteMemory(db, args.id)
+          return {
+            output: deleted
+              ? `Deleted: ${existing.title}\nThis memory will not be re-extracted.`
+              : `Memory was already deleted: ${args.id}`,
           }
         },
       }),

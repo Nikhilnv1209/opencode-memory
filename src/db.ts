@@ -1,8 +1,8 @@
 // Database init, queries, and FTS for the memory plugin
 
 import { Database } from "bun:sqlite"
-import { SCHEMA } from "./schema.ts"
-import type { Memory, TopicIndexEntry } from "./schema.ts"
+import { SCHEMA, MIGRATION_ADD_SOURCE_DELETED } from "./schema.ts"
+import type { Memory, TopicIndexEntry, MemorySource } from "./schema.ts"
 
 /** Initialize a project memory database. */
 export function initDb(dbPath: string): Database {
@@ -10,78 +10,142 @@ export function initDb(dbPath: string): Database {
   db.exec("PRAGMA journal_mode = WAL")
   db.exec("PRAGMA foreign_keys = ON")
   db.exec(SCHEMA)
-  // One-time cleanup: remove junk from recursive-loop bug + exact duplicates
-  db.exec("DELETE FROM memory WHERE importance < 0.1")
-  db.exec(`
-    DELETE FROM memory
-    WHERE rowid IN (
-      SELECT m1.rowid FROM memory m1
-      WHERE EXISTS (
-        SELECT 1 FROM memory m2
-        WHERE m2.topic = m1.topic AND m2.title = m1.title
-        AND (m2.importance > m1.importance OR (m2.importance = m1.importance AND m2.rowid < m1.rowid))
-      )
-    )
-  `)
+
+  // Migration: add source and deleted columns if missing (existing databases)
+  const columns = db.query("PRAGMA table_info(memory)").all() as { name: string }[]
+  const hasSource = columns.some((c) => c.name === "source")
+  const hasDeleted = columns.some((c) => c.name === "deleted")
+  if (!hasSource) db.exec("ALTER TABLE memory ADD COLUMN source TEXT NOT NULL DEFAULT 'extraction'")
+  if (!hasDeleted) db.exec("ALTER TABLE memory ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+  if (!hasDeleted) db.exec("CREATE INDEX IF NOT EXISTS idx_memory_deleted ON memory(deleted)")
+
+  // One-time cleanup: remove junk from recursive-loop bug
+  db.exec("DELETE FROM memory WHERE importance < 0.1 AND deleted = 0")
   return db
 }
 
-/** Check if a similar memory already exists (same topic + title fuzzy match). */
+// --- Stopwords for Jaccard similarity ---
+const STOPWORDS = new Set([
+  "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+  "have", "has", "had", "do", "does", "did", "will", "would", "could",
+  "should", "may", "might", "must", "can", "shall", "to", "of", "in",
+  "on", "at", "by", "for", "with", "about", "as", "into", "through",
+  "during", "before", "after", "above", "below", "from", "up", "down",
+  "and", "or", "but", "if", "then", "else", "when", "where", "why",
+  "how", "all", "any", "both", "each", "few", "more", "most", "other",
+  "some", "such", "no", "not", "only", "own", "same", "so", "than",
+  "too", "very", "just", "this", "that", "these", "those", "i", "you",
+  "he", "she", "it", "we", "they", "what", "which", "who", "whom",
+  "user", "memory", "session", "work", "like", "also",
+])
+
+/** Normalize text into a Set of significant words for Jaccard comparison. */
+function wordSet(text: string): Set<string> {
+  return new Set(
+    text.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 2 && !STOPWORDS.has(w)),
+  )
+}
+
+/** Compute Jaccard similarity between two word sets. */
+function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0
+  let intersection = 0
+  for (const word of a) {
+    if (b.has(word)) intersection++
+  }
+  return intersection / (a.size + b.size - intersection)
+}
+
+/**
+ * Check if a similar memory already exists.
+ * Uses exact title match, fuzzy title prefix, AND Jaccard content similarity.
+ * Compares against ALL memories (including deleted) to prevent re-extraction
+ * of deleted memories.
+ */
 function findDuplicate(db: Database, mem: Memory): Memory | null {
-  // Exact title match on same topic
+  // Exact title match on same topic (including deleted — prevents re-adding deleted)
   const exact = db
     .query(
       `SELECT * FROM memory
-       WHERE topic = ? AND title = ? AND superseded_by IS NULL
+       WHERE topic = ? AND title = ?
        LIMIT 1`,
     )
     .get(...[mem.topic, mem.title]) as RawMemoryRow | null
-
   if (exact) return rowToMemory(exact)
 
-  // Fuzzy: same topic + first 40 chars of title match (catches minor wording differences)
+  // Fuzzy: same topic + first 40 chars of title match
   const fuzzy = db
     .query(
       `SELECT * FROM memory
-       WHERE topic = ? AND substr(title, 1, 40) = substr(?, 1, 40) AND superseded_by IS NULL
+       WHERE topic = ? AND substr(title, 1, 40) = substr(?, 1, 40)
        LIMIT 1`,
     )
     .get(...[mem.topic, mem.title]) as RawMemoryRow | null
-
   if (fuzzy) return rowToMemory(fuzzy)
 
-  return null
+  // Jaccard content similarity against same-topic memories (including deleted)
+  const candidates = db
+    .query(
+      `SELECT * FROM memory WHERE topic = ? AND superseded_by IS NULL`,
+    )
+    .all(...[mem.topic]) as RawMemoryRow[]
+
+  if (candidates.length === 0) return null
+
+  const newWords = wordSet(mem.title + " " + mem.content)
+  let bestMatch: Memory | null = null
+  let bestScore = 0
+
+  for (const row of candidates) {
+    const existingWords = wordSet(row.title + " " + row.content)
+    const score = jaccardSimilarity(newWords, existingWords)
+    if (score > 0.4 && score > bestScore) {
+      bestScore = score
+      bestMatch = rowToMemory(row)
+    }
+  }
+
+  return bestMatch
 }
 
 /**
  * Store a memory, or merge with an existing duplicate.
- * If a similar memory exists (same topic + similar title), the more complete
- * version wins and the other is marked superseded.
+ * Compares against ALL memories (including deleted) to prevent re-extraction.
+ * If a duplicate is found:
+ * - If duplicate is deleted → skip (user already decided it's wrong)
+ * - If duplicate is manual → skip (manual memories take priority)
+ * - If new is richer/higher importance → supersede old
+ * - Otherwise → skip
  */
 export function storeMemory(db: Database, mem: Memory): void {
   const existing = findDuplicate(db, mem)
 
   if (existing) {
-    // Keep whichever has higher importance or longer content
+    // Don't re-add if the duplicate was deleted by the user
+    if (existing.deleted) return
+
+    // Don't supersede manually-added memories with extracted ones
+    if (existing.source === "manual" && mem.source === "extraction") return
+
     const newIsBetter = mem.importance >= existing.importance && mem.content.length >= existing.content.length
 
     if (newIsBetter) {
-      // New memory replaces old — mark old as superseded, store new
       db.run(`UPDATE memory SET superseded_by = ? WHERE id = ?`, [mem.id, existing.id])
       insertMemory(db, mem)
-    } else {
-      // Existing is better — skip the new one, leave existing as-is
-      return
     }
   } else {
     insertMemory(db, mem)
   }
 }
 
+/** Insert a memory row directly (no dedup check). */
 function insertMemory(db: Database, mem: Memory): void {
   db.run(
-    `INSERT INTO memory (id, session_id, project_id, scope, type, category, topic, title, content, keywords, importance, created_at, last_accessed, access_count, superseded_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO memory (id, session_id, project_id, scope, type, category, topic, title, content, keywords, importance, created_at, last_accessed, access_count, superseded_by, source, deleted)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       mem.id,
       mem.session_id,
@@ -98,11 +162,13 @@ function insertMemory(db: Database, mem: Memory): void {
       mem.last_accessed,
       mem.access_count,
       mem.superseded_by,
+      mem.source,
+      mem.deleted,
     ],
   )
 }
 
-/** Search memories using FTS5. Returns matching memories with importance boosting. */
+/** Search memories using FTS5. Excludes deleted and superseded. */
 export function searchMemories(
   db: Database,
   opts: {
@@ -115,7 +181,6 @@ export function searchMemories(
 ): Memory[] {
   const limit = opts.limit ?? 5
 
-  // FTS5 search on title + content + keywords
   const ftsQuery = opts.query
     .split(/\s+/)
     .filter((w) => w.length > 0)
@@ -128,6 +193,7 @@ export function searchMemories(
     SELECT m.* FROM memory m
     JOIN memory_fts f ON m.rowid = f.rowid
     WHERE memory_fts MATCH ?
+    AND m.deleted = 0 AND m.superseded_by IS NULL
   `
   const params: unknown[] = [ftsQuery]
 
@@ -151,14 +217,14 @@ export function searchMemories(
   return rows.map(rowToMemory)
 }
 
-/** Get recent memories with proper recency decay calculation. */
+/** Get recent memories with recency decay. Excludes deleted and superseded. */
 export function getRecentMemoriesDecayed(db: Database, projectId: string, limit: number): Memory[] {
   const now = Date.now()
   const rows = db
     .query(
       `SELECT *, importance * (1.0 / (1 + (? - created_at) / 86400000.0 * 0.1)) * (1.0 + access_count * 0.1) as score
        FROM memory
-       WHERE project_id = ? AND superseded_by IS NULL
+       WHERE project_id = ? AND superseded_by IS NULL AND deleted = 0
        ORDER BY score DESC
        LIMIT ?`,
     )
@@ -166,13 +232,26 @@ export function getRecentMemoriesDecayed(db: Database, projectId: string, limit:
   return rows.map(({ score, ...row }) => rowToMemory(row))
 }
 
-/** Get topic index: topic -> count + categories. */
+/** Get manually-added memories (for extraction signals). Excludes deleted. */
+export function getManualMemories(db: Database, projectId: string, limit: number): Memory[] {
+  const rows = db
+    .query(
+      `SELECT * FROM memory
+       WHERE project_id = ? AND source = 'manual' AND deleted = 0 AND superseded_by IS NULL
+       ORDER BY importance DESC, created_at DESC
+       LIMIT ?`,
+    )
+    .all(...[projectId, limit]) as RawMemoryRow[]
+  return rows.map(rowToMemory)
+}
+
+/** Get topic index: topic -> count + categories. Excludes deleted. */
 export function getTopicIndex(db: Database, projectId: string): TopicIndexEntry[] {
   const rows = db
     .query(
       `SELECT topic, COUNT(*) as count, GROUP_CONCAT(DISTINCT category) as categories
        FROM memory
-       WHERE project_id = ? AND superseded_by IS NULL
+       WHERE project_id = ? AND superseded_by IS NULL AND deleted = 0
        GROUP BY topic
        ORDER BY count DESC`,
     )
@@ -185,24 +264,24 @@ export function getTopicIndex(db: Database, projectId: string): TopicIndexEntry[
   }))
 }
 
-/** Get unfinished (prospective) memories. */
+/** Get unfinished (prospective) memories. Excludes deleted. */
 export function getUnfinishedMemories(db: Database, projectId: string): Memory[] {
   const rows = db
     .query(
       `SELECT * FROM memory
-       WHERE project_id = ? AND type = 'prospective' AND superseded_by IS NULL
+       WHERE project_id = ? AND type = 'prospective' AND superseded_by IS NULL AND deleted = 0
        ORDER BY importance DESC, created_at DESC`,
     )
     .all(...[projectId]) as RawMemoryRow[]
   return rows.map(rowToMemory)
 }
 
-/** Get memories by topic. */
+/** Get memories by topic. Excludes deleted. */
 export function getMemoriesByTopic(db: Database, projectId: string, topic: string): Memory[] {
   const rows = db
     .query(
       `SELECT * FROM memory
-       WHERE project_id = ? AND topic = ? AND superseded_by IS NULL
+       WHERE project_id = ? AND topic = ? AND superseded_by IS NULL AND deleted = 0
        ORDER BY created_at DESC`,
     )
     .all(...[projectId, topic]) as RawMemoryRow[]
@@ -220,10 +299,10 @@ export function boostAccessed(db: Database, memoryIds: string[]): void {
   }
 }
 
-/** Count total memories for a project. */
+/** Count active (non-deleted) memories for a project. */
 export function countMemories(db: Database, projectId: string): number {
   const row = db
-    .query(`SELECT COUNT(*) as count FROM memory WHERE project_id = ?`)
+    .query(`SELECT COUNT(*) as count FROM memory WHERE project_id = ? AND deleted = 0`)
     .get(...[projectId]) as { count: number }
   return row.count
 }
@@ -231,12 +310,62 @@ export function countMemories(db: Database, projectId: string): number {
 /** Count memories for a specific session (used for backfill dedup). */
 export function countMemoriesBySession(db: Database, sessionID: string): number {
   const row = db
-    .query(`SELECT COUNT(*) as count FROM memory WHERE session_id = ?`)
+    .query(`SELECT COUNT(*) as count FROM memory WHERE session_id = ? AND deleted = 0`)
     .get(...[sessionID]) as { count: number }
   return row.count
 }
 
-/** Prune lowest-importance memories when limit is exceeded. */
+/** Soft-delete a memory by ID. */
+export function deleteMemory(db: Database, id: string): boolean {
+  const result = db.run(
+    `UPDATE memory SET deleted = 1 WHERE id = ? AND deleted = 0`,
+    [id],
+  )
+  return result.changes > 0
+}
+
+/** Update a memory's content, importance, and keywords by ID. */
+export function updateMemory(
+  db: Database,
+  id: string,
+  updates: { content?: string; importance?: number; keywords?: string[]; title?: string },
+): Memory | null {
+  const sets: string[] = []
+  const params: unknown[] = []
+
+  if (updates.title !== undefined) {
+    sets.push("title = ?")
+    params.push(updates.title)
+  }
+  if (updates.content !== undefined) {
+    sets.push("content = ?")
+    params.push(updates.content)
+  }
+  if (updates.importance !== undefined) {
+    sets.push("importance = ?")
+    params.push(updates.importance)
+  }
+  if (updates.keywords !== undefined) {
+    sets.push("keywords = ?")
+    params.push(JSON.stringify(updates.keywords))
+  }
+
+  if (sets.length === 0) return null
+
+  params.push(id)
+  db.run(`UPDATE memory SET ${sets.join(", ")} WHERE id = ? AND deleted = 0`, ...params)
+
+  const row = db.query(`SELECT * FROM memory WHERE id = ?`).get(id) as RawMemoryRow | null
+  return row ? rowToMemory(row) : null
+}
+
+/** Get a single memory by ID. */
+export function getMemoryById(db: Database, id: string): Memory | null {
+  const row = db.query(`SELECT * FROM memory WHERE id = ?`).get(id) as RawMemoryRow | null
+  return row ? rowToMemory(row) : null
+}
+
+/** Prune lowest-importance memories when limit is exceeded. Only prunes active memories. */
 export function pruneMemories(db: Database, projectId: string, maxMemories: number): number {
   const count = countMemories(db, projectId)
   if (count <= maxMemories) return 0
@@ -244,7 +373,7 @@ export function pruneMemories(db: Database, projectId: string, maxMemories: numb
   const excess = count - maxMemories
   db.run(
     `DELETE FROM memory WHERE id IN (
-      SELECT id FROM memory WHERE project_id = ?
+      SELECT id FROM memory WHERE project_id = ? AND deleted = 0
       ORDER BY importance ASC, last_accessed ASC LIMIT ?
     )`,
     [projectId, excess],
@@ -270,6 +399,8 @@ type RawMemoryRow = {
   last_accessed: number
   access_count: number
   superseded_by: string | null
+  source: string
+  deleted: number
 }
 
 function rowToMemory(row: RawMemoryRow): Memory {
@@ -289,5 +420,7 @@ function rowToMemory(row: RawMemoryRow): Memory {
     last_accessed: row.last_accessed,
     access_count: row.access_count,
     superseded_by: row.superseded_by,
+    source: (row.source ?? "extraction") as MemorySource,
+    deleted: row.deleted ?? 0,
   }
 }

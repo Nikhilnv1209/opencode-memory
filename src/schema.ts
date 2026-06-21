@@ -20,7 +20,11 @@ export interface Memory {
   last_accessed: number
   access_count: number
   superseded_by: string | null
+  source: MemorySource
+  deleted: number
 }
+
+export type MemorySource = "manual" | "extraction"
 
 export interface TopicIndexEntry {
   topic: string
@@ -45,7 +49,9 @@ CREATE TABLE IF NOT EXISTS memory (
   created_at INTEGER NOT NULL,
   last_accessed INTEGER NOT NULL DEFAULT 0,
   access_count INTEGER NOT NULL DEFAULT 0,
-  superseded_by TEXT
+  superseded_by TEXT,
+  source TEXT NOT NULL DEFAULT 'extraction',
+  deleted INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_project ON memory(project_id);
@@ -53,6 +59,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_topic ON memory(topic);
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type);
 CREATE INDEX IF NOT EXISTS idx_memory_importance ON memory(importance DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_created ON memory(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_deleted ON memory(deleted);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
   title,
@@ -79,6 +86,13 @@ CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN
   INSERT INTO memory_fts(rowid, title, content, keywords)
   VALUES (new.rowid, new.title, new.content, new.keywords);
 END;
+`
+
+/** Migration: add source and deleted columns to existing databases. */
+export const MIGRATION_ADD_SOURCE_DELETED = `
+ALTER TABLE memory ADD COLUMN source TEXT NOT NULL DEFAULT 'extraction';
+ALTER TABLE memory ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_memory_deleted ON memory(deleted);
 `
 
 // Global database schema (cross-project: personality candidates + state)

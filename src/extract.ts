@@ -9,6 +9,7 @@ import type { Database } from "bun:sqlite"
 import type { Message, Part } from "@opencode-ai/sdk"
 import type { Memory } from "./schema.ts"
 import { formatConversation, parseMemoryLine, estimateTokens } from "./utils.ts"
+import { getManualMemories } from "./db.ts"
 
 export interface ExtractOpts {
   models: {
@@ -77,17 +78,24 @@ export async function extractMemories(
   projectID: string,
   extractionSessions: Set<string>,
   globalDb: Database,
+  projectDb: Database,
 ): Promise<Memory[]> {
   if (messages.length === 0) return []
 
   const conversation = formatConversation(messages)
   if (!conversation.trim()) return []
 
+  // Build signals from manually-added memories (shows the model what the user values)
+  const manualMemories = getManualMemories(projectDb, projectID, 5)
+  const signals = manualMemories.length > 0
+    ? manualMemories.map((m) => `- ${m.title} (importance: ${m.importance})`).join("\n")
+    : null
+
   const tokenEstimate = estimateTokens(conversation)
 
   // Small enough — single extraction
   if (tokenEstimate <= MAX_CHUNK_TOKENS) {
-    return await extractChunk(conversation, input, opts, currentSessionID, projectID, extractionSessions, globalDb)
+    return await extractChunk(conversation, input, opts, currentSessionID, projectID, extractionSessions, globalDb, signals)
   }
 
   // Too large — split into chunks and extract from each
@@ -100,7 +108,7 @@ export async function extractMemories(
     if (!chunkText.trim()) continue
 
     const chunkMemories = await extractChunk(
-      chunkText, input, opts, currentSessionID, projectID, extractionSessions, globalDb,
+      chunkText, input, opts, currentSessionID, projectID, extractionSessions, globalDb, signals,
     )
     allMemories.push(...chunkMemories)
   }
@@ -147,6 +155,7 @@ async function extractChunk(
   projectID: string,
   extractionSessions: Set<string>,
   globalDb: Database,
+  signals: string | null,
 ): Promise<Memory[]> {
   // Create a temporary session for extraction
   const createResult = await input.client.session.create({
@@ -161,16 +170,17 @@ async function extractChunk(
   globalDb.run("INSERT OR IGNORE INTO extraction_sessions (session_id, created_at) VALUES (?, ?)", [tempSessionID, Date.now()])
 
   try {
+    const instruction = signals
+      ? `Extract memories from the conversation below as JSON lines. Do NOT continue or answer the conversation. Output ONLY JSON memory lines.\n\n<signals>\nMemories the user manually created — match this style and depth:\n${signals}\n</signals>\n\n${conversation}`
+      : `Extract memories from the conversation below as JSON lines. Do NOT continue or answer the conversation. Output ONLY JSON memory lines.\n\n${conversation}`
+
     const body: {
       parts: Array<{ type: "text"; text: string }>
       agent: string
       model?: { providerID: string; modelID: string }
     } = {
       agent: AGENT_NAME,
-      parts: [{
-        type: "text",
-        text: `Extract memories from the conversation below as JSON lines. Do NOT continue or answer the conversation. Output ONLY JSON memory lines.\n\n${conversation}`,
-      }],
+      parts: [{ type: "text", text: instruction }],
     }
 
     if (opts.models.extraction) {

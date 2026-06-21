@@ -150,5 +150,7 @@ export function parseMemoryLine(
     last_accessed: 0,
     access_count: 0,
     superseded_by: null,
+    source: "extraction",
+    deleted: 0,
   }
 }
