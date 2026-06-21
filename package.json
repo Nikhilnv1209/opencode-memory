@@ -1,0 +1,16 @@
+{
+  "name": "opencode-memory",
+  "version": "1.0.0",
+  "description": "Persistent cross-session memory with personality profiling for opencode agents",
+  "type": "module",
+  "main": "index.ts",
+  "exports": {
+    "./server": "./index.ts"
+  },
+  "engines": {
+    "opencode": ">=1.17.0"
+  },
+  "dependencies": {},
+  "keywords": ["opencode", "memory", "agent", "personality", "cross-session"],
+  "license": "Apache-2.0"
+}
