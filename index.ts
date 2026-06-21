@@ -292,7 +292,7 @@ export default (async (ctx, options) => {
       // Backfill memories from previous sessions (user-controlled)
       memory_backfill: tool({
         description:
-          "Backfill memories from previous sessions. Without args: shows progress if backfill is running, otherwise lists unprocessed sessions with options. With sessionIDs: processes those specific sessions. With all=true: processes all unprocessed sessions (up to limit). With status=true: shows only the current progress. Extraction runs in the background.",
+          "Backfill memories from previous sessions. Without args: lists unprocessed sessions with options. With sessionIDs: processes those specific sessions. With all=true: processes all unprocessed sessions (up to limit). With status=true: shows only the current progress. Blocks until completion and returns the result.",
         args: {
           sessionIDs: tool.schema.array(tool.schema.string()).optional().describe("Specific session IDs to backfill"),
           all: tool.schema.boolean().optional().describe("Backfill all unprocessed sessions"),
@@ -396,13 +396,35 @@ export default (async (ctx, options) => {
             return { output: "No sessions to backfill." }
           }
 
-          // Run in background — doesn't block the agent
-          void backfillFromList(targets)
+          await backfillFromList(targets)
+
+          return { output: formatBackfillStatus(backfillStatus!) }
+        },
+      }),
+
+      // List all memories (no search query needed)
+      memory_list: tool({
+        description:
+          "List all stored memories. Use this when the user asks to see all memories or what's been extracted. Returns memories sorted by importance.",
+        args: {
+          limit: tool.schema.number().optional().describe("Max results, default 50"),
+        },
+        async execute(args) {
+          if (disposed) return { output: "Plugin is disposed." }
+
+          const limit = args.limit ?? 50
+          const memories = getRecentMemoriesDecayed(db, ctx.worktree, limit)
+
+          if (memories.length === 0) {
+            return { output: "No memories stored yet." }
+          }
 
           return {
-            output:
-              `Backfill started for ${targets.length} session(s) in the background.\n` +
-              `Call memory_backfill with status=true to check progress.`,
+            output: memories
+              .map((m, i) =>
+                `${i + 1}. [${m.type}/${m.scope}] ${m.title}\n   ${m.content.slice(0, 200)}\n   Keywords: ${(m.keywords ?? []).join(", ")} | Importance: ${m.importance}`,
+              )
+              .join("\n\n"),
           }
         },
       }),
