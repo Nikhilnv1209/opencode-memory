@@ -14,6 +14,10 @@
     "@opencode-ai/plugin": "^1.17.9",
     "zod": "4"
   },
+  "scripts": {
+    "postinstall": "bun run scripts/postinstall.ts"
+  },
+  "files": ["index.ts", "src", "agent", "scripts"],
   "keywords": ["opencode", "memory", "agent", "personality", "cross-session"],
   "license": "Apache-2.0"
 }

@@ -11,7 +11,7 @@ import {
   initDb, storeMemory, getRecentMemoriesDecayed, getTopicIndex,
   pruneMemories, countMemoriesBySession, searchMemories, boostAccessed,
 } from "./src/db.ts"
-import { extractMemories, type ExtractOpts } from "./src/extract.ts"
+import { extractMemories, type ExtractOpts, ensureAgentFile } from "./src/extract.ts"
 import { generatePrimer, generateIndex } from "./src/primer.ts"
 import { hashDir } from "./src/utils.ts"
 
@@ -44,7 +44,45 @@ class Semaphore {
   }
 }
 
+/** Format backfill progress as readable text. */
+interface BackfillStatus {
+  running: boolean
+  total: number
+  processed: number
+  extracted: number
+  errors: number
+  startedAt: number
+  finishedAt: number | null
+  currentTitle: string | null
+}
+
+function formatBackfillStatus(s: BackfillStatus): string {
+  const pct = s.total > 0 ? Math.round((s.processed / s.total) * 100) : 0
+  const elapsed = Math.round(((s.finishedAt ?? Date.now()) - s.startedAt) / 1000)
+
+  const lines = [
+    `Progress: ${s.processed}/${s.total} sessions (${pct}%)`,
+    `Memories extracted: ${s.extracted}`,
+  ]
+
+  if (s.errors > 0) lines.push(`Errors: ${s.errors}`)
+  lines.push(`Time: ${elapsed}s`)
+
+  if (s.running && s.currentTitle) {
+    lines.push(`Currently processing: ${s.currentTitle}`)
+  }
+
+  if (!s.running && s.finishedAt) {
+    lines.push(`Status: completed`)
+  }
+
+  return lines.join("\n")
+}
+
 export default (async (ctx, options) => {
+  // --- Ensure extraction agent is installed globally ---
+  ensureAgentFile()
+
   // --- Storage setup ---
   const opencodeDir = join(homedir(), ".opencode")
   const memoryDir = join(opencodeDir, "memory")
@@ -62,6 +100,7 @@ export default (async (ctx, options) => {
   // --- State ---
   const extractionSessions = new Set<string>()
   const extractingSessions = new Set<string>()
+  let lastActiveSessionID: string | null = null
   let disposed = false
 
   // --- Parse options ---
@@ -72,7 +111,7 @@ export default (async (ctx, options) => {
       consolidation: null,
       personality: null,
     },
-    triggers: (raw.triggers as string[]) ?? ["compaction", "session-end"],
+    triggers: (raw.triggers as string[]) ?? ["compaction", "session-switch"],
     contextBudget: (raw.contextBudget as number) ?? 800,
     contextualInjection: (raw.contextualInjection as boolean) ?? true,
     consolidateOnStart: (raw.consolidateOnStart as boolean) ?? true,
@@ -89,30 +128,8 @@ export default (async (ctx, options) => {
     return !!row
   }
 
-  /** Cached map of all tool IDs set to false (disabled).
-   *  Fetched once from the server, reused for all extraction sessions. */
-  let cachedDisabledTools: Record<string, boolean> | null = null
-
-  async function getDisabledTools(): Promise<Record<string, boolean>> {
-    if (cachedDisabledTools) return cachedDisabledTools
-    try {
-      const result = await ctx.client.tool.ids()
-      const ids = result.data ?? []
-      cachedDisabledTools = {}
-      for (const id of ids) {
-        cachedDisabledTools[id] = false
-      }
-    } catch {
-      // If tool.ids() fails, fall back to disabling common tools by name
-      cachedDisabledTools = {
-        bash: false, edit: false, read: false, write: false,
-        grep: false, glob: false, task: false, webfetch: false,
-        todowrite: false, question: false, skill: false,
-        list: false, lsp: false, memory_backfill: false, memory_search: false,
-      }
-    }
-    return cachedDisabledTools
-  }
+  /** Backfill progress tracker. */
+  let backfillStatus: BackfillStatus | null = null
 
   /**
    * Extract memories from a single session.
@@ -134,10 +151,8 @@ export default (async (ctx, options) => {
       const messages = result.data ?? []
       if (messages.length === 0) return
 
-      const disabledTools = await getDisabledTools()
-
       const memories = await extractMemories(
-        messages, ctx, opts, sessionID, ctx.worktree, extractionSessions, globalDb, disabledTools,
+        messages, ctx, opts, sessionID, ctx.worktree, extractionSessions, globalDb,
       )
 
       if (disposed) return
@@ -156,72 +171,94 @@ export default (async (ctx, options) => {
   }
 
   /**
-   * Backfill memories from a list of sessions.
-   * Fires all sessions at once — the semaphore limits actual concurrency.
-   * With maxConcurrentExtractions=1 (default), sessions are processed sequentially.
-   * With maxConcurrentExtractions=3, up to 3 sessions are extracted in parallel.
+   * Backfill memories from a list of sessions sequentially.
+   * Updates backfillStatus so the tool can report progress.
+   * Respects the semaphore (waits if a normal extraction is running).
    */
-  async function backfillFromList(sessionIDs: string[]): Promise<{ processed: number; extracted: number }> {
-    let processed = 0
-    let extracted = 0
+  async function backfillFromList(
+    sessions: Array<{ id: string; title: string }>,
+  ): Promise<void> {
+    backfillStatus = {
+      running: true,
+      total: sessions.length,
+      processed: 0,
+      extracted: 0,
+      errors: 0,
+      startedAt: Date.now(),
+      finishedAt: null,
+      currentTitle: null,
+    }
 
-    const results = await Promise.all(
-      sessionIDs.map(async (sessionID) => {
-        if (disposed) return
-        if (isExtractionSession(sessionID)) return
-        if (extractingSessions.has(sessionID)) return
-        if (countMemoriesBySession(db, sessionID) > 0) return
+    for (const session of sessions) {
+      if (disposed) break
 
-        extractingSessions.add(sessionID)
-        await semaphore.acquire()
+      // Skip extraction sessions and already-processed sessions
+      if (isExtractionSession(session.id) ||
+          extractingSessions.has(session.id) ||
+          countMemoriesBySession(db, session.id) > 0) {
+        backfillStatus.processed++
+        continue
+      }
 
-        try {
-          if (disposed) return
+      backfillStatus.currentTitle = session.title
+      extractingSessions.add(session.id)
+      await semaphore.acquire()
 
-          const result = await ctx.client.session.messages({ path: { id: sessionID } })
-          const messages = result.data ?? []
-          if (messages.length === 0) return
+      try {
+        if (disposed) break
 
-          const disabledTools = await getDisabledTools()
-
-          const memories = await extractMemories(
-            messages, ctx, opts, sessionID, ctx.worktree, extractionSessions, globalDb, disabledTools,
-          )
-
-          if (disposed) return
-
-          const worthKeeping = memories.filter((m) => m.importance >= 0.1)
-          for (const mem of worthKeeping) {
-            storeMemory(db, mem)
-          }
-
-          return { processed: 1, extracted: worthKeeping.length }
-        } catch (err) {
-          console.error("[memory] Backfill failed for session", sessionID, err)
-          return
-        } finally {
-          semaphore.release()
-          extractingSessions.delete(sessionID)
+        const result = await ctx.client.session.messages({ path: { id: session.id } })
+        const messages = result.data ?? []
+        if (messages.length === 0) {
+          backfillStatus.processed++
+          continue
         }
-      }),
-    )
 
-    for (const r of results) {
-      if (r) {
-        processed += r.processed
-        extracted += r.extracted
+        const memories = await extractMemories(
+          messages, ctx, opts, session.id, ctx.worktree, extractionSessions, globalDb,
+        )
+
+        if (disposed) break
+
+        const worthKeeping = memories.filter((m) => m.importance >= 0.1)
+        for (const mem of worthKeeping) {
+          storeMemory(db, mem)
+        }
+
+        backfillStatus.processed++
+        backfillStatus.extracted += worthKeeping.length
+      } catch (err) {
+        console.error("[memory] Backfill failed for session", session.id, err)
+        backfillStatus.errors++
+        backfillStatus.processed++
+      } finally {
+        semaphore.release()
+        extractingSessions.delete(session.id)
       }
     }
 
     if (!disposed) pruneMemories(db, ctx.worktree, opts.maxMemories)
-    return { processed, extracted }
+
+    backfillStatus.running = false
+    backfillStatus.finishedAt = Date.now()
+    backfillStatus.currentTitle = null
   }
 
   return {
     // 1. INJECT: personality + primer + index (within contextBudget)
+    //    Also detects session switches for extraction
     "experimental.chat.system.transform": async (req, output) => {
       if (req.sessionID && isExtractionSession(req.sessionID)) return
       if (disposed) return
+
+      // Detect session switch — extract from the previous session
+      if (opts.triggers.includes("session-switch") &&
+          lastActiveSessionID &&
+          lastActiveSessionID !== req.sessionID &&
+          !isExtractionSession(lastActiveSessionID)) {
+        void runExtraction(lastActiveSessionID)
+      }
+      lastActiveSessionID = req.sessionID
 
       try {
         const personalityFile = Bun.file(personalityPath)
@@ -250,30 +287,49 @@ export default (async (ctx, options) => {
       await runExtraction(req.sessionID)
     },
 
-    // 3. EXTRACT at session idle
-    event: async ({ event }) => {
-      if (event.type !== "session.idle") return
-      if (!opts.triggers.includes("session-end")) return
-
-      const sessionID = (event.properties as { sessionID?: string })?.sessionID
-      if (!sessionID) return
-      if (isExtractionSession(sessionID)) return
-      await runExtraction(sessionID)
-    },
-
-    // 4. TOOLS
+    // 3. TOOLS
     tool: {
       // Backfill memories from previous sessions (user-controlled)
       memory_backfill: tool({
         description:
-          "Backfill memories from previous sessions. Without args: lists sessions that haven't been processed yet. With sessionIDs: processes those specific sessions. With all=true: processes all unprocessed sessions (up to limit). Extraction runs in the background.",
+          "Backfill memories from previous sessions. Without args: shows progress if backfill is running, otherwise lists unprocessed sessions with options. With sessionIDs: processes those specific sessions. With all=true: processes all unprocessed sessions (up to limit). With status=true: shows only the current progress. Extraction runs in the background.",
         args: {
           sessionIDs: tool.schema.array(tool.schema.string()).optional().describe("Specific session IDs to backfill"),
           all: tool.schema.boolean().optional().describe("Backfill all unprocessed sessions"),
           limit: tool.schema.number().optional().describe("Max sessions to process when all=true (default 10)"),
+          status: tool.schema.boolean().optional().describe("Only show backfill progress, don't list sessions or start backfill"),
         },
         async execute(args) {
           if (disposed) return { output: "Plugin is disposed, cannot backfill." }
+
+          // Status-only mode: just report progress
+          if (args.status) {
+            if (!backfillStatus || (!backfillStatus.running && !backfillStatus.finishedAt)) {
+              return { output: "No backfill has been run yet." }
+            }
+            return { output: formatBackfillStatus(backfillStatus) }
+          }
+
+          // If backfill is running, report progress instead of listing sessions
+          if (backfillStatus?.running) {
+            return {
+              output:
+                `Backfill is currently running.\n\n` +
+                formatBackfillStatus(backfillStatus) +
+                `\n\nWait for it to finish, or call memory_backfill with status=true to check again later.`,
+            }
+          }
+
+          // Show results of last completed backfill (if recently finished)
+          if (backfillStatus?.finishedAt && Date.now() - backfillStatus.finishedAt < 60000) {
+            const lastResult = formatBackfillStatus(backfillStatus)
+            backfillStatus = null // Clear so next call shows session list
+            return {
+              output: `Last backfill completed:\n\n${lastResult}\n\n---\n\n`,
+            }
+          }
+
+          backfillStatus = null
 
           // List mode: show unprocessed sessions
           if (!args.sessionIDs && !args.all) {
@@ -306,7 +362,11 @@ export default (async (ctx, options) => {
               output:
                 `Found ${unprocessed.length} session(s) without memories:\n\n` +
                 lines.join("\n") +
-                `\n\nTo backfill: call memory_backfill with sessionIDs=["id1","id2"] for specific sessions, or all=true for all.`,
+                `\n\nOPTIONS — ask the user:\n` +
+                `- "Backfill ALL sessions" → call memory_backfill with all=true\n` +
+                `- "Backfill specific sessions" → ask user which numbers (e.g. "1 and 3"), ` +
+                `then call memory_backfill with sessionIDs=["id1","id2"]\n` +
+                `After starting, call memory_backfill with status=true to check progress.`,
             }
           }
 
@@ -317,17 +377,19 @@ export default (async (ctx, options) => {
             .filter((s) => !isExtractionSession(s.id))
             .sort((a, b) => b.time.created - a.time.created)
 
-          let targets: string[]
+          let targets: Array<{ id: string; title: string }>
 
           if (args.all) {
             const limit = args.limit ?? 10
             targets = allSessions
               .filter((s) => countMemoriesBySession(db, s.id) === 0)
               .slice(0, limit)
-              .map((s) => s.id)
+              .map((s) => ({ id: s.id, title: s.title }))
           } else {
             const idSet = new Set(args.sessionIDs!)
-            targets = allSessions.filter((s) => idSet.has(s.id)).map((s) => s.id)
+            targets = allSessions
+              .filter((s) => idSet.has(s.id))
+              .map((s) => ({ id: s.id, title: s.title }))
           }
 
           if (targets.length === 0) {
@@ -339,8 +401,8 @@ export default (async (ctx, options) => {
 
           return {
             output:
-              `Backfill started for ${targets.length} session(s) in the background. ` +
-              `Memories will appear as they're extracted. Use memory_backfill (no args) again to check progress.`,
+              `Backfill started for ${targets.length} session(s) in the background.\n` +
+              `Call memory_backfill with status=true to check progress.`,
           }
         },
       }),
@@ -382,8 +444,13 @@ export default (async (ctx, options) => {
       }),
     },
 
-    // 5. CLEANUP
+    // 4. CLEANUP — extract from last active session, then close
     dispose: async () => {
+      if (opts.triggers.includes("session-switch") &&
+          lastActiveSessionID &&
+          !isExtractionSession(lastActiveSessionID)) {
+        await runExtraction(lastActiveSessionID).catch(() => {})
+      }
       disposed = true
       db.close()
       globalDb.close()

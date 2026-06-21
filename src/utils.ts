@@ -96,18 +96,31 @@ export function formatConversation(messages: Array<{ info: Message; parts: Part[
   return lines.join("\n\n")
 }
 
-/** Parse a single JSON memory line from the extraction LLM response. */
+/** Parse a single JSON memory line from the extraction LLM response.
+ * Handles lines that may be wrapped in markdown code blocks. */
 export function parseMemoryLine(
   line: string,
   sessionID: string,
   projectID: string,
 ): Memory | null {
-  const trimmed = line.trim()
-  if (!trimmed || !trimmed.startsWith("{")) return null
+  let trimmed = line.trim()
+  if (!trimmed) return null
+
+  // Strip markdown code block markers
+  if (trimmed.startsWith("```")) {
+    trimmed = trimmed.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "")
+  }
+
+  // Extract first JSON object on the line
+  const start = trimmed.indexOf("{")
+  if (start === -1) return null
+  const end = trimmed.lastIndexOf("}")
+  if (end === -1 || end < start) return null
+  const jsonStr = trimmed.slice(start, end + 1)
 
   let parsed: Record<string, unknown>
   try {
-    parsed = JSON.parse(trimmed)
+    parsed = JSON.parse(jsonStr)
   } catch {
     return null
   }
