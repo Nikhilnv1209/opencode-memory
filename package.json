@@ -10,7 +10,10 @@
   "engines": {
     "opencode": ">=1.17.0"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.17.9",
+    "zod": "4"
+  },
   "keywords": ["opencode", "memory", "agent", "personality", "cross-session"],
   "license": "Apache-2.0"
 }

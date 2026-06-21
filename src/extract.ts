@@ -16,6 +16,7 @@ export interface ExtractOpts {
   contextualInjection: boolean
   consolidateOnStart: boolean
   maxMemories: number
+  maxConcurrentExtractions: number
 }
 
 const EXTRACTION_PROMPT = `You are a memory extraction system for an AI agent.
@@ -55,17 +56,26 @@ RULES:
 - Use the SAME topic as previous sessions if this is continuation work.
 - Prefer fewer, richer memories over many shallow ones.
 - Output each memory as a single line of JSON.
-
-Conversation:
 `
 
 /**
  * Extract memories from a conversation by creating a temporary session,
  * sending the extraction prompt, and parsing the response.
  *
+ * The temp session is lightweight:
+ * - system prompt = extraction instructions (not the default agent prompt)
+ * - tools = {} (no tools loaded — saves tokens, no tool schemas sent)
+ * - model = opts.models.extraction or user's default
+ *
  * The temp session ID is added to extractionSessions BEFORE the prompt is sent
  * so that all plugin hooks (system.transform, compacting, event) can detect and
  * skip it — preventing a recursive extraction loop.
+ *
+ * Why a temp session instead of a direct LLM call?
+ * The plugin API (PluginInput) doesn't expose LLM.Service.stream() — the internal
+ * mechanism that compaction and title generation use for session-less LLM calls.
+ * The only LLM call available to plugins is via the session prompt HTTP API.
+ * This is a limitation of the current plugin V1 interface, not a design choice.
  */
 export async function extractMemories(
   messages: Array<{ info: Message; parts: Part[] }>,
@@ -80,8 +90,6 @@ export async function extractMemories(
   const conversation = formatConversation(messages)
   if (!conversation.trim()) return []
 
-  const fullPrompt = EXTRACTION_PROMPT + conversation
-
   // Create a temporary session for extraction
   const createResult = await input.client.session.create({
     body: { title: "memory-extraction" },
@@ -95,11 +103,19 @@ export async function extractMemories(
   extractionSessions.add(tempSessionID)
 
   try {
+    // Build the prompt body — lightweight session with no tools
     const body: {
       parts: Array<{ type: "text"; text: string }>
+      system: string
+      tools: Record<string, never>
       model?: { providerID: string; modelID: string }
     } = {
-      parts: [{ type: "text", text: fullPrompt }],
+      // Extraction instructions go in the system prompt
+      system: EXTRACTION_PROMPT,
+      // Conversation goes as the user message
+      parts: [{ type: "text", text: conversation }],
+      // Disable all tools — extraction is text-only
+      tools: {},
     }
 
     if (opts.models.extraction) {

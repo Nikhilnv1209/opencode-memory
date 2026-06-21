@@ -228,6 +228,14 @@ export function countMemories(db: Database, projectId: string): number {
   return row.count
 }
 
+/** Count memories for a specific session (used for backfill dedup). */
+export function countMemoriesBySession(db: Database, sessionID: string): number {
+  const row = db
+    .query(`SELECT COUNT(*) as count FROM memory WHERE session_id = ?`)
+    .get(...[sessionID]) as { count: number }
+  return row.count
+}
+
 /** Prune lowest-importance memories when limit is exceeded. */
 export function pruneMemories(db: Database, projectId: string, maxMemories: number): number {
   const count = countMemories(db, projectId)
